@@ -7,9 +7,11 @@ const SUPABASE_ANON_KEY =
 
 export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-// Simple in-memory shared camera stream so provider + client views
-// can access the same MediaStream in this demo.
-let sharedCameraStream = null;
+// WebRTC globals (per-browser-tab). These are not shared between devices,
+// signaling is done via Supabase Realtime channels per ad.
+let localStream = null; // provider's camera stream
+let providerPeerConnection = null;
+let clientPeerConnection = null;
 
 export default function App() {
   const [screen, setScreen] = useState("role-select");
@@ -159,7 +161,7 @@ export default function App() {
                       video: true,
                       audio: false,
                     });
-                    sharedCameraStream = stream;
+                    localStream = stream;
                   } catch (camErr) {
                     console.warn("Camera error:", camErr);
                     alert(
@@ -175,7 +177,7 @@ export default function App() {
                 // Supabase status update with stronger error handling
                 const { data, error } = await supabase
                   .from("ads")
-                  .update({ status: "accepted" })
+                  .update({ status: "camera_ready" })
                   .eq("id", ad.id)
                   .select("*")
                   .single();
@@ -399,7 +401,7 @@ function AdManagerView({ ads = [], clientId, setScreen, setSelectedAd }) {
                   className={`px-2 py-1 rounded-full text-[0.65rem] ${
                     ad.status === "open"
                       ? "bg-slate-700 text-slate-200"
-                      : ad.status === "accepted"
+                      : ad.status === "camera_ready"
                       ? "bg-emerald-500/20 text-emerald-300"
                       : "bg-slate-500/30 text-slate-200"
                   }`}
@@ -410,7 +412,7 @@ function AdManagerView({ ads = [], clientId, setScreen, setSelectedAd }) {
               <p className="text-slate-400">
                 {ad.city}, {ad.country}
               </p>
-              {ad.status === "accepted" ? (
+              {ad.status === "camera_ready" ? (
                 <button
                   className="mt-1 w-full bg-emerald-500 text-slate-900 py-2 rounded-xl text-xs font-semibold"
                   onClick={() => {
@@ -575,88 +577,175 @@ function ProviderJobDetails({ ad, setScreen, onAccept }) {
 /* ===== PROVIDER LIVE CAMERA VIEW ===== */
 
 function ProviderLiveView({ ad, setScreen }) {
-  const cameraRef = useRef(null);
-  const [showAd, setShowAd] = useState(false);
+  // Provider sees only the ad material full-screen.
+  // Camera runs in the background and is sent to the client via WebRTC.
+  const mediaUrl = ad.media_path
+    ? supabase.storage.from("ad-media").getPublicUrl(ad.media_path).data.publicUrl
+    : null;
+  const isVideo = mediaUrl ? mediaUrl.endsWith(".mp4") : false;
+
+  const [connectionStatus, setConnectionStatus] = useState("initial");
+  const signalingChannelRef = useRef(null);
 
   useEffect(() => {
-    const stream = sharedCameraStream;
-    if (stream && cameraRef.current) {
-      cameraRef.current.srcObject = stream;
+    let cancelled = false;
+
+    async function setupWebRTC() {
+      try {
+        setConnectionStatus("connecting");
+
+        const channel = supabase.channel(`webrtc_ad_${ad.id}`);
+        signalingChannelRef.current = channel;
+
+        channel.on("broadcast", { event: "signal" }, (event) => {
+          const payload = event.payload;
+          if (!payload || payload.from === "provider") return;
+          if (!providerPeerConnection) return;
+
+          if (payload.type === "answer" && payload.sdp) {
+            const desc = new RTCSessionDescription(payload.sdp);
+            providerPeerConnection.setRemoteDescription(desc).catch((err) => {
+              console.error("Error setting remote answer:", err);
+            });
+          } else if (payload.type === "ice-candidate" && payload.candidate) {
+            providerPeerConnection
+              .addIceCandidate(new RTCIceCandidate(payload.candidate))
+              .catch((err) => {
+                console.error("Error adding ICE candidate (provider):", err);
+              });
+          }
+        });
+
+        await channel.subscribe();
+
+        // Ensure we have a localStream (camera). If it was already created on accept, reuse it.
+        if (!localStream) {
+          if (
+            typeof navigator !== "undefined" &&
+            navigator.mediaDevices?.getUserMedia &&
+            typeof window !== "undefined" &&
+            window.isSecureContext
+          ) {
+            localStream = await navigator.mediaDevices.getUserMedia({
+              video: true,
+              audio: false,
+            });
+          } else {
+            console.warn("Camera API not available or insecure context for provider.");
+          }
+        }
+
+        providerPeerConnection = new RTCPeerConnection({
+          iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+        });
+
+        if (localStream) {
+          localStream.getTracks().forEach((track) => {
+            providerPeerConnection.addTrack(track, localStream);
+          });
+        }
+
+        providerPeerConnection.onicecandidate = (event) => {
+          if (event.candidate) {
+            channel
+              .send({
+                type: "broadcast",
+                event: "signal",
+                payload: {
+                  from: "provider",
+                  type: "ice-candidate",
+                  candidate: event.candidate,
+                  adId: ad.id,
+                },
+              })
+              .catch((err) => {
+                console.error("Error sending ICE candidate (provider):", err);
+              });
+          }
+        };
+
+        const offer = await providerPeerConnection.createOffer();
+        await providerPeerConnection.setLocalDescription(offer);
+
+        await channel.send({
+          type: "broadcast",
+          event: "signal",
+          payload: {
+            from: "provider",
+            type: "offer",
+            sdp: offer,
+            adId: ad.id,
+          },
+        });
+
+        if (!cancelled) {
+          setConnectionStatus("waiting-client");
+        }
+      } catch (err) {
+        console.error("Provider WebRTC setup error:", err);
+        if (!cancelled) setConnectionStatus("error");
+      }
     }
+
+    setupWebRTC();
+
     return () => {
-      if (stream) stream.getTracks().forEach((t) => t.stop());
-      if (sharedCameraStream === stream) sharedCameraStream = null;
+      cancelled = true;
+      if (signalingChannelRef.current) {
+        supabase.removeChannel(signalingChannelRef.current);
+      }
+      if (providerPeerConnection) {
+        providerPeerConnection.close();
+        providerPeerConnection = null;
+      }
     };
-  }, []);
-
-  const mediaUrl = ad.media_path
-    ? supabase.storage.from("ad-media").getPublicUrl(ad.media_path).data
-        .publicUrl
-    : null;
-
-  const isVideo = mediaUrl ? mediaUrl.endsWith(".mp4") : false;
+  }, [ad?.id]);
 
   return (
     <div className="flex flex-col gap-4 text-center">
-      <h2 className="text-lg font-semibold">
-        Material Display + Audience Camera
-      </h2>
+      <h2 className="text-lg font-semibold">Ad Material Display</h2>
 
-      {showAd ? (
-        <div className="bg-black rounded-xl overflow-hidden h-64 flex items-center justify-center">
-          {mediaUrl && isVideo ? (
-            <video
-              src={mediaUrl}
-              autoPlay
-              loop
-              muted
-              className="w-full h-full object-contain"
-            />
-          ) : (
-            mediaUrl && (
-              <img
-                src={mediaUrl}
-                className="w-full h-full object-contain"
-                alt="Ad media"
-              />
-            )
-          )}
-        </div>
-      ) : (
-        <div className="grid grid-cols-2 gap-3 h-64">
-          <div className="bg-black rounded-xl overflow-hidden flex items-center justify-center">
-            <p className="text-slate-400 text-xs">
-              Press SHOW AD to display material
-            </p>
-          </div>
-          <div className="bg-black rounded-xl overflow-hidden flex items-center justify-center">
-            {sharedCameraStream ? (
-              <video
-                ref={cameraRef}
-                autoPlay
-                playsInline
-                muted
-                className="w-full h-full object-cover"
-              />
-            ) : (
-              <p className="text-slate-400 text-xs">Camera inactive</p>
-            )}
-          </div>
-        </div>
+      {connectionStatus === "waiting-client" && (
+        <p className="text-[0.65rem] text-emerald-300">
+          Camera is active. Waiting for client to open live view…
+        </p>
+      )}
+      {connectionStatus === "connecting" && (
+        <p className="text-[0.65rem] text-slate-300">
+          Setting up secure camera connection…
+        </p>
+      )}
+      {connectionStatus === "error" && (
+        <p className="text-[0.65rem] text-red-400">
+          Camera connection error. Client may not see live video.
+        </p>
       )}
 
-      <button
-        onClick={() => setShowAd(!showAd)}
-        className="w-full bg-emerald-500 text-slate-900 py-3 rounded-2xl text-sm font-semibold"
-      >
-        {showAd ? "Hide Ad" : "Show Ad"}
-      </button>
+      <div className="bg-black rounded-xl overflow-hidden h-64 flex items-center justify-center">
+        {mediaUrl && isVideo ? (
+          <video
+            src={mediaUrl}
+            autoPlay
+            loop
+            muted
+            className="w-full h-full object-contain"
+          />
+        ) : mediaUrl ? (
+          <img
+            src={mediaUrl}
+            className="w-full h-full object-contain"
+            alt="Ad media"
+          />
+        ) : (
+          <p className="text-slate-400 text-xs">No media available.</p>
+        )}
+      </div>
 
       <button
         onClick={() => setScreen("provider-dashboard")}
         className="w-full bg-slate-700 text-slate-100 py-3 rounded-2xl text-sm mt-2"
       >
-        Stop & Back
+        Back
       </button>
     </div>
   );
@@ -664,24 +753,116 @@ function ProviderLiveView({ ad, setScreen }) {
 
 /* ===== CLIENT LIVE VIEW ===== */
 
-function ClientLiveView({ setScreen }) {
+function ClientLiveView({ ad, setScreen }) {
   const videoRef = useRef(null);
-  const [hasStream, setHasStream] = useState(!!sharedCameraStream);
+  const [status, setStatus] = useState("waiting");
+  const signalingChannelRef = useRef(null);
 
   useEffect(() => {
-    const interval = setInterval(() => {
-      if (sharedCameraStream && videoRef.current) {
-        if (videoRef.current.srcObject !== sharedCameraStream) {
-          videoRef.current.srcObject = sharedCameraStream;
-        }
-        setHasStream(true);
-      } else {
-        setHasStream(false);
-      }
-    }, 500);
+    let remoteStream = new MediaStream();
 
-    return () => clearInterval(interval);
-  }, []);
+    async function setupClient() {
+      try {
+        setStatus("waiting");
+
+        const channel = supabase.channel(`webrtc_ad_${ad.id}`);
+        signalingChannelRef.current = channel;
+
+        clientPeerConnection = new RTCPeerConnection({
+          iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+        });
+
+        clientPeerConnection.ontrack = (event) => {
+          event.streams[0].getTracks().forEach((track) => {
+            remoteStream.addTrack(track);
+          });
+
+          if (videoRef.current) {
+            videoRef.current.srcObject = remoteStream;
+          }
+          setStatus("connected");
+        };
+
+        clientPeerConnection.onicecandidate = (event) => {
+          if (event.candidate) {
+            channel
+              .send({
+                type: "broadcast",
+                event: "signal",
+                payload: {
+                  from: "client",
+                  type: "ice-candidate",
+                  candidate: event.candidate,
+                  adId: ad.id,
+                },
+              })
+              .catch((err) => {
+                console.error("Error sending ICE candidate (client):", err);
+              });
+          }
+        };
+
+        channel.on("broadcast", { event: "signal" }, async (event) => {
+          const payload = event.payload;
+          if (!payload || payload.from === "client") return;
+          if (!clientPeerConnection) return;
+
+          try {
+            if (payload.type === "offer" && payload.sdp) {
+              setStatus("connecting");
+              const offerDesc = new RTCSessionDescription(payload.sdp);
+              await clientPeerConnection.setRemoteDescription(offerDesc);
+              const answer = await clientPeerConnection.createAnswer();
+              await clientPeerConnection.setLocalDescription(answer);
+
+              await channel.send({
+                type: "broadcast",
+                event: "signal",
+                payload: {
+                  from: "client",
+                  type: "answer",
+                  sdp: answer,
+                  adId: ad.id,
+                },
+              });
+            } else if (
+              payload.type === "ice-candidate" &&
+              payload.candidate
+            ) {
+              await clientPeerConnection.addIceCandidate(
+                new RTCIceCandidate(payload.candidate)
+              );
+            }
+          } catch (err) {
+            console.error("Client signaling handling error:", err);
+            setStatus("error");
+          }
+        });
+
+        await channel.subscribe();
+      } catch (err) {
+        console.error("Client WebRTC setup error:", err);
+        setStatus("error");
+      }
+    }
+
+    setupClient();
+
+    return () => {
+      if (signalingChannelRef.current) {
+        supabase.removeChannel(signalingChannelRef.current);
+      }
+      if (clientPeerConnection) {
+        clientPeerConnection.close();
+        clientPeerConnection = null;
+      }
+      if (videoRef.current && videoRef.current.srcObject) {
+        const tracks = videoRef.current.srcObject.getTracks();
+        tracks.forEach((t) => t.stop());
+        videoRef.current.srcObject = null;
+      }
+    };
+  }, [ad?.id]);
 
   const handleApprove = () => {
     setScreen("ad-manager");
@@ -695,18 +876,25 @@ function ClientLiveView({ setScreen }) {
     <div className="flex flex-col gap-4 text-center">
       <h2 className="text-lg font-semibold">Live Job Verification</h2>
       <p className="text-slate-400 text-xs">
-        Confirm that the provider is displaying your ad in the correct
-        location.
+        Confirm that the provider is displaying your ad in the correct location.
       </p>
 
-      {!hasStream && (
+      {status === "waiting" && (
         <p className="text-slate-500 text-xs">
-          Waiting for provider to start camera…
+          Waiting for provider to activate camera…
+        </p>
+      )}
+      {status === "connecting" && (
+        <p className="text-slate-500 text-xs">Connecting to live video…</p>
+      )}
+      {status === "error" && (
+        <p className="text-red-400 text-xs">
+          There was a problem setting up live video.
         </p>
       )}
 
       <div className="bg-black rounded-2xl overflow-hidden h-64 flex items-center justify-center">
-        {hasStream ? (
+        {status === "connected" ? (
           <video
             ref={videoRef}
             autoPlay
@@ -715,8 +903,8 @@ function ClientLiveView({ setScreen }) {
           />
         ) : (
           <p className="text-slate-400 text-xs px-4">
-            Live video will appear here once the provider has an active camera
-            stream.
+            Live video will appear here once the provider&apos;s camera is
+            connected.
           </p>
         )}
       </div>
